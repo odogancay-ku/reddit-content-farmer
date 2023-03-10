@@ -1,37 +1,25 @@
-import random
-import signal
+import logging
+from multiprocessing import Pool
 from pathlib import Path
-
-import psutil
-from selenium_scripts import *
-from scraper_scripts import *
-
-import moviepy.editor as mp
-from moviepy.editor import AudioFileClip, ImageClip
-from mutagen.mp3 import MP3
-
 from pprint import pprint
 
-from gtts import gTTS
-
-from multiprocessing import Pool
-
+import moviepy.editor as mp
 import praw
-
-import urllib3
-
-from telegram import Update
-from telegram.ext import CallbackContext
-from telegram.ext import CommandHandler
-from telegram.ext import Updater
-
-import asyncio
+import win32gui
+from aiogram import Bot, Dispatcher, executor, types
+from gtts import gTTS
+from moviepy.editor import AudioFileClip, ImageClip
+from mutagen.mp3 import MP3
+from scraper_scripts import *
+from selenium_scripts import *
+from selenium_scripts import get_configurations
 
 # region Constants and Config
 
-urllib3.disable_warnings()
-
+logging.basicConfig(level=logging.INFO)
 logger = Logger()
+
+urllib3.disable_warnings()
 
 run = True
 hold = False
@@ -77,49 +65,40 @@ config.update(credentials)
 
 print("Credentials: ", credentials)
 
+# endregion
+
+
+# region Aiogram config
+API_TOKEN = credentials['telegram_bot_token']
+
+# Initialize bot and dispatcher
+bot = Bot(token=API_TOKEN)
+dp = Dispatcher(bot)
+
 
 # endregion
 
 
-# region Content Creation
+class WindowFinder:
 
-def parse_farmer_input_file() -> list[dict]:
-    data = []
-    with open(config['input_path'], 'r', encoding='utf-8') as input_file:
-        reader = csv.reader(input_file)
-        raw_data = list(reader)
+    def __init__(self):
+        self._handle = None
 
-        for row in raw_data:
-            # Parse Comment or Malformed Row
-            if row[1][0] == '!' or len(row) < 4:
-                continue
+    def find_window(self, class_name, window_name=None):
+        """Pass a window class name & window name directly if known to get the window """
+        self._handle = \
+            win32gui.FindWindow(class_name, window_name)
 
-            batch_input = {
-                'fetch_mode': row[0],
-                'subreddit_array': row[1],
-                'fetch_settings': row[2],
-                'submission_limit': int(row[3]),
-                'comment_limit': int(row[4]) if len(row) >= 5 else 5,
-            }
+    def _window_enum_callback(self, hwnd, wildcard):
+        '''Call back func which checks each open window and matches the name of window using reg ex'''
+        if re.match(wildcard, str(win32gui.GetWindowText(hwnd))) != None:
+            self._handle = hwnd
 
-            data.append(batch_input)
+    def find_window_wildcard(self, wildcard):
+        """ This function takes a string as input and calls EnumWindows to enumerate through all open windows """
 
-    return data
-
-
-def parse_farmer_input(batch_order: str) -> dict:
-    # Parse Comment or Malformed Row
-    batch_order = batch_order.split(',')
-
-    batch_input = {
-        'fetch_mode': batch_order[0],
-        'subreddit_array': batch_order[1],
-        'fetch_settings': batch_order[2],
-        'submission_limit': int(batch_order[3]),
-        'comment_limit': int(batch_order[4]) if len(batch_order) >= 5 else 5,
-    }
-
-    return batch_input
+        self._handle = None
+        win32gui.EnumWindows(self._window_enum_callback, wildcard)
 
 
 def merge_audio_png(image_path: str, audio_path: str, out_path: str) -> bool:
@@ -142,6 +121,21 @@ def resize_by_width(target_width: int, video_path: str) -> mp.VideoFileClip:
     clip_resized.write_videofile(video_path, verbose=False, temp_audiofile=video_path.replace('.mp4', '-temp.mp4'))
 
     return clip
+
+
+def parse_farmer_input(batch_order: str) -> dict:
+    # Parse Comment or Malformed Row
+    batch_order = batch_order.split(',')
+
+    batch_input = {
+        'fetch_mode': batch_order[0],
+        'subreddit_array': batch_order[1],
+        'fetch_settings': batch_order[2],
+        'submission_limit': int(batch_order[3]),
+        'comment_limit': int(batch_order[4]) if len(batch_order) >= 5 else 5,
+    }
+
+    return batch_input
 
 
 def fetch_post_content(driver, post_raw, output_path, inp):
@@ -305,39 +299,19 @@ def merge_post(merge_info: dict):
 
                 clips = [post_final_clip, comment_clip]
                 post_final_clip = mp.concatenate_videoclips(clips, method="compose")
-            except:
+            except Exception:
                 logger.log_error()
 
         post_final_clip.write_videofile(merge_info['path'] + "final.mp4", verbose=False,
                                         temp_audiofile=merge_info['path'] + "final-temp.mp4")
-    except:
+
+        executor.start(dp, bot.send_message(credentials['telegram_primary_chat_id'],
+                                            f"Video of {os.path.dirname(merge_info['path'])} ready"))
+        with open(merge_info['path'] + "final.mp4", 'rb') as video:
+            executor.start(dp, bot.send_video(credentials['telegram_primary_chat_id'], video=video))
+
+    except Exception:
         logger.log_error(f"Error at post merge {merge_info}")
-
-
-async def multiprocess_merge_all_posts():
-    merge_infos = []
-    for path in Path('./archive/').rglob('merge.json'):
-        with open(path, 'r', encoding='utf-8') as merge_file:
-            merge_info = json.load(merge_file)
-            merge_infos.append(merge_info)
-
-    print(merge_infos)
-    pool = Pool(5)
-    pool.map(merge_post, merge_infos)
-    pool.join()
-
-    priv_bot.send_message(chat_id=credentials['telegram_primary_chat_id'],
-                          text=f"Queued order of merging is done successfully.")
-
-
-async def merge_all_posts():
-    for path in Path('./archive/').rglob('merge.json'):
-        with open(path, 'r', encoding='utf-8') as merge_file:
-            merge_info = json.load(merge_file)
-            merge_post(merge_info)
-
-    priv_bot.send_message(chat_id=credentials['telegram_primary_chat_id'],
-                          text=f"Queued order of merging is done successfully.")
 
 
 async def fetch_qa_content_from_batch(driver: selenium.webdriver.Chrome, inp: dict):
@@ -377,111 +351,76 @@ async def fetch_qa_content_from_batch(driver: selenium.webdriver.Chrome, inp: di
                 logger.log_error()
     except Exception as e:
         logger.log_error(f"Error at fetching post content")
-        priv_bot.send_message(chat_id=credentials['telegram_primary_chat_id'],
-                              text=f"Queued order {inp} is done with error {e}.")
+        await bot.send_message(chat_id=credentials['telegram_primary_chat_id'],
+                               text=f"Queued order {inp} is done with error {e}.")
     else:
-        priv_bot.send_message(chat_id=credentials['telegram_primary_chat_id'],
-                              text=f"Queued order {inp} is done successfully.")
+        await bot.send_message(chat_id=credentials['telegram_primary_chat_id'],
+                               text=f"Queued order {inp} is done successfully.")
 
 
-# endregion
+async def multiprocess_merge_all_posts():
+    merge_infos = []
+    for path in Path('./archive/').rglob('merge.json'):
+        with open(path, 'r', encoding='utf-8') as merge_file:
+            merge_info = json.load(merge_file)
+            merge_infos.append(merge_info)
+
+    print(merge_infos)
+    pool = Pool(os.cpu_count())
+    pool.map(merge_post, merge_infos)
+    pool.close()
+    pool.join()
+
+    await bot.send_message(chat_id=credentials['telegram_primary_chat_id'],
+                           text=f"Queued order of merging is done successfully.")
 
 
-# region Telegram
-
-def kill_child_processes(parent_pid, sig=signal.SIGTERM):
-    try:
-        parent = psutil.Process(parent_pid)
-    except psutil.NoSuchProcess:
-        return
-    children = parent.children(recursive=True)
-    print(children)
-    for process in children:
-        process.send_signal(sig)
-        process.kill()
-
-    try:
-        os.system('taskkill /F /IM "chrome.exe" /T')
-    except:
-        logger.log_error(f"Error at taskkil")
+@dp.message_handler(commands=['start', 'help'])
+async def send_welcome(message: types.Message):
+    await message.reply(f"Start Up\nConfig = {config}")
 
 
-def telegram_start(update: Update, context: CallbackContext):
-    context.bot.send_message(chat_id=update.effective_chat.id, text=update.effective_chat.id)
-
-
-def telegram_fetch(update: Update, context: CallbackContext):
-    global loop
+@dp.message_handler(commands=['fetch'])
+async def fetch(message: types.Message):
 
     try:
-        inp = parse_farmer_input(context.args[0])
-    except:
-        context.bot.send_message(chat_id=update.effective_chat.id, text="Batch order could not be parsed")
+        inp = parse_farmer_input(message.get_args())
+    except Exception:
+        traceback.print_exc()
+        await bot.send_message(message.chat.id, f"Could not parse order")
     else:
-        context.bot.send_message(chat_id=update.effective_chat.id, text="Opening browser")
+        print("parsed:", inp)
         driver = get_driver(minimized=False,
                             options=[r"--user-data-dir=C:\Users\ofaru\AppData\Local\Google\Chrome\User Data",
                                      r'--profile-directory=Profile 8'])
+
+        print("Browser opened")
+
         driver.set_window_size(600, 800)
-
+        await bot.send_message(message.chat.id, f"Browser open")
         if inp['fetch_mode'] == 'qa':
-            context.bot.send_message(chat_id=update.effective_chat.id,
-                                     text=f"Queueing q&a content farm using order {inp}")
-            add_coroutine_to_main(fetch_qa_content_from_batch(driver, inp))
+            print("qa mode")
+            await bot.send_message(message.chat.id, f"Queueing q&a content farm using order {inp}")
+            await fetch_qa_content_from_batch(driver, inp)
 
 
-def telegram_merge(update: Update, context: CallbackContext):
-    global loop
-
-    if context.args and context.args[0] == 'singular':
-        context.bot.send_message(chat_id=update.effective_chat.id,
-                                 text=f"Queueing merging of content components")
-        add_coroutine_to_main(merge_all_posts())
-
+@dp.message_handler(commands=['merge'])
+async def merge(message: types.Message):
+    if 'singular' in message.get_args():
+        pass
     else:
-        context.bot.send_message(chat_id=update.effective_chat.id,
-                                 text=f"Queueing multiprocessor merging of content components")
-
-        add_coroutine_to_main(multiprocess_merge_all_posts())
+        await bot.send_message(message.chat.id, f"Starting multithreaded merging")
+        await multiprocess_merge_all_posts()
 
 
-updater = Updater(token=credentials['telegram_bot_token'], use_context=True)
-dispatcher = updater.dispatcher
-
-priv_bot = updater.bot
-priv_bot.send_message(chat_id=credentials['telegram_primary_chat_id'], text="Start up")
-
-
-async def telegram_loop():
-    start_handler = CommandHandler('start', telegram_start, run_async=True)
-    dispatcher.add_handler(start_handler)
-
-    fetch_handler = CommandHandler('fetch', telegram_fetch, run_async=True)
-    dispatcher.add_handler(fetch_handler)
-
-    merge_handler = CommandHandler('merge', telegram_merge, run_async=True)
-    dispatcher.add_handler(merge_handler)
-
-    updater.start_polling()
+@dp.message_handler(commands=['upload'])
+async def upload_all(message: types.Message):
+    for path in Path('./archive/').rglob('final.mp4'):
+        pass
 
 
-# endregion
-
-tasks = []
-
-
-def add_coroutine_to_main(coroutine: asyncio.futures):
-    t = loop.create_task(coroutine)
-    tasks.append(t)
-
-
-async def main():
-    await asyncio.sleep(5)
-
-    if tasks:
-        await asyncio.gather(*tasks)
-
-    tasks.clear()
+async def start_up():
+    await bot.send_message(credentials['telegram_primary_chat_id'], "Start up")
 
 
 if __name__ == '__main__':
@@ -494,17 +433,5 @@ if __name__ == '__main__':
         user_agent="ContentCreator Fetch content at a reasonable rate"
     )
 
-    loop = asyncio.get_event_loop()
-    try:
-        loop.create_task(main())
-        loop.create_task(telegram_loop())
-        loop.run_forever()
-    finally:
-        updater.stop()
-
-        pending = asyncio.all_tasks(loop=loop)
-        for task in pending:
-            task.cancel()
-
-        loop.stop()
-        loop.close()
+    executor.start(dp, start_up())
+    executor.start_polling(dp, skip_updates=True)
